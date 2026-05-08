@@ -83,9 +83,52 @@ type localState struct {
 	Unread       map[string]int       `json:"unread"`
 	SeenMessage  map[string]bool      `json:"seen_message"`
 	Pending      map[string]bool      `json:"pending"`
+	Delivered    map[string]bool      `json:"delivered"`
+	ReadByPeer   map[string]bool      `json:"read_by_peer"`
 	Outbox       []queuedMessage      `json:"outbox"`
 	LastSyncAt   string               `json:"last_sync_at"`
 	ActiveGroups map[string]groupRoom `json:"active_groups"`
+}
+
+type presenceState struct {
+	NodeID    string `json:"node_id"`
+	NodeName  string `json:"node_name"`
+	DeviceID  string `json:"device_id"`
+	Status    string `json:"status"`
+	LastSeen  string `json:"last_seen"`
+	Transport string `json:"transport"`
+}
+
+type typingState struct {
+	From      string `json:"from"`
+	To        string `json:"to"`
+	IsTyping  bool   `json:"is_typing"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type groupEvent struct {
+	ID        string `json:"id"`
+	GroupID   string `json:"group_id"`
+	Type      string `json:"type"` // create|add|remove|promote|demote|msg
+	ActorID   string `json:"actor_id"`
+	TargetID  string `json:"target_id,omitempty"`
+	Payload   string `json:"payload,omitempty"`
+	CreatedAt string `json:"created_at"`
+}
+
+type groupLedger struct {
+	GroupID   string       `json:"group_id"`
+	UpdatedAt string       `json:"updated_at"`
+	Events    []groupEvent `json:"events"`
+}
+
+type callSignal struct {
+	ID        string `json:"id"`
+	FromID    string `json:"from_id"`
+	FromName  string `json:"from_name"`
+	ToID      string `json:"to_id"`
+	Action    string `json:"action"` // invite|accept|decline|hangup
+	CreatedAt string `json:"created_at"`
 }
 
 func pairKey(a, b string) string {
@@ -100,6 +143,20 @@ func requestKey(toNodeID string) string {
 
 func groupKey(groupID string) string {
 	return "vx6chat/group/" + groupID
+}
+
+func presenceKey(nodeID string) string {
+	return "vx6chat/presence/" + nodeID
+}
+
+func typingKey(a, b string) string {
+	ids := []string{a, b}
+	sort.Strings(ids)
+	return "vx6chat/typing/" + ids[0] + "/" + ids[1]
+}
+
+func callSignalKey(nodeID string) string {
+	return "vx6chat/call/" + nodeID
 }
 
 func marshalJSON(v any) []byte {

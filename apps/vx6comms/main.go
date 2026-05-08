@@ -52,6 +52,8 @@ func main() {
 			Unread:       map[string]int{},
 			SeenMessage:  map[string]bool{},
 			Pending:      map[string]bool{},
+			Delivered:    map[string]bool{},
+			ReadByPeer:   map[string]bool{},
 			Outbox:       []queuedMessage{},
 			ActiveGroups: map[string]groupRoom{},
 		},
@@ -177,6 +179,16 @@ func main() {
 	chatInput := widget.NewMultiLineEntry()
 	chatInput.SetMinRowsVisible(4)
 	chatInput.SetPlaceHolder("Type message")
+	typingLabel := widget.NewLabel("")
+	presenceLabel := widget.NewLabel("Presence: unknown")
+
+	chatInput.OnChanged = func(_ string) {
+		idx := int(atomic.LoadInt32(&st.selected))
+		cs := st.sortedContacts()
+		if idx >= 0 && idx < len(cs) {
+			_ = st.publishTyping(cs[idx].NodeID, strings.TrimSpace(chatInput.Text) != "")
+		}
+	}
 
 	sendBtn := widget.NewButton("Send", func() {
 		idx := int(atomic.LoadInt32(&st.selected))
@@ -193,6 +205,7 @@ func main() {
 			dialog.ShowError(err, w)
 			return
 		}
+		_ = st.publishTyping(cs[idx].NodeID, false)
 		chatInput.SetText("")
 		_ = st.refreshConversation(cs[idx], chatLog)
 	})
@@ -239,8 +252,44 @@ func main() {
 		}()
 	})
 
+	callBtn := widget.NewButton("Call Invite", func() {
+		idx := int(atomic.LoadInt32(&st.selected))
+		cs := st.sortedContacts()
+		if idx < 0 || idx >= len(cs) {
+			dialog.ShowInformation("Select Contact", "Pick a contact first.", w)
+			return
+		}
+		if err := st.sendCallSignal(cs[idx], "invite"); err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		dialog.ShowInformation("Call Invite", "Call signal sent. RTP/media plane is next phase.", w)
+	})
+
+	mediaList := widget.NewList(
+		func() int {
+			items, _ := st.listReceivedFiles(40)
+			return len(items)
+		},
+		func() fyne.CanvasObject { return widget.NewLabel("file") },
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			items, _ := st.listReceivedFiles(40)
+			if i < 0 || i >= len(items) {
+				return
+			}
+			o.(*widget.Label).SetText(items[i])
+		},
+	)
+	refreshMediaBtn := widget.NewButton("Refresh Inbox", func() { mediaList.Refresh() })
+
 	groupName := widget.NewEntry()
 	groupName.SetPlaceHolder("Group name")
+	groupIDInput := widget.NewEntry()
+	groupIDInput.SetPlaceHolder("Group ID")
+	groupMemberInput := widget.NewEntry()
+	groupMemberInput.SetPlaceHolder("Member NodeID")
+	groupMsgInput := widget.NewEntry()
+	groupMsgInput.SetPlaceHolder("Group message")
 	createGroupBtn := widget.NewButton("Create Group", func() {
 		if err := st.createGroup(strings.TrimSpace(groupName.Text)); err != nil {
 			dialog.ShowError(err, w)
@@ -248,6 +297,25 @@ func main() {
 		}
 		groupName.SetText("")
 		dialog.ShowInformation("Group Created", "Group metadata published.", w)
+	})
+	addMemberBtn := widget.NewButton("Add Member", func() {
+		if err := st.groupMemberChange(strings.TrimSpace(groupIDInput.Text), strings.TrimSpace(groupMemberInput.Text), "add"); err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+	})
+	removeMemberBtn := widget.NewButton("Remove Member", func() {
+		if err := st.groupMemberChange(strings.TrimSpace(groupIDInput.Text), strings.TrimSpace(groupMemberInput.Text), "remove"); err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+	})
+	sendGroupBtn := widget.NewButton("Send Group Msg", func() {
+		if err := st.publishGroupMessage(strings.TrimSpace(groupIDInput.Text), strings.TrimSpace(groupMsgInput.Text)); err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+		groupMsgInput.SetText("")
 	})
 
 	contactsList.OnSelected = func(id widget.ListItemID) {
@@ -257,6 +325,7 @@ func main() {
 			st.local.Unread[cs[id].NodeID] = 0
 			_ = st.saveLocalState()
 			_ = st.refreshConversation(cs[id], chatLog)
+			presenceLabel.SetText("Presence: " + st.peerPresenceSummary(cs[id].NodeID))
 		}
 	}
 
@@ -272,6 +341,7 @@ func main() {
 
 	centerPanel := container.NewVBox(
 		widget.NewCard("Conversation", "", chatLog),
+		widget.NewCard("Status", "", container.NewVBox(presenceLabel, typingLabel)),
 		container.NewGridWithColumns(2, sendBtn, syncBtn),
 		chatInput,
 	)
@@ -279,8 +349,13 @@ func main() {
 	rightPanel := container.NewVBox(
 		widget.NewCard("Invite Link", "", container.NewVBox(genInviteBtn, inviteBox)),
 		widget.NewCard("Add Contact", "", container.NewVBox(inviteIn, addInviteBtn)),
-		widget.NewCard("Media", "", container.NewVBox(filePath, sendFileBtn)),
-		widget.NewCard("Groups", "", container.NewVBox(groupName, createGroupBtn)),
+		widget.NewCard("Media", "", container.NewVBox(filePath, sendFileBtn, refreshMediaBtn, mediaList)),
+		widget.NewCard("Groups", "", container.NewVBox(
+			groupName, createGroupBtn, groupIDInput, groupMemberInput,
+			container.NewGridWithColumns(2, addMemberBtn, removeMemberBtn),
+			groupMsgInput, sendGroupBtn,
+		)),
+		widget.NewCard("Calls", "", container.NewVBox(callBtn)),
 	)
 
 	midSplit := container.NewHSplit(centerPanel, rightPanel)
@@ -300,8 +375,16 @@ func main() {
 		t := time.NewTicker(4 * time.Second)
 		defer t.Stop()
 		for range t.C {
+			_ = st.publishPresence()
 			_ = st.syncInboxAndRequests(w, chatLog, int(atomic.LoadInt32(&st.selected)))
 			_ = st.retryPending()
+			if idx := int(atomic.LoadInt32(&st.selected)); idx >= 0 {
+				cs := st.sortedContacts()
+				if idx < len(cs) {
+					typingLabel.SetText(st.typingSummary(cs[idx].NodeID))
+					presenceLabel.SetText("Presence: " + st.peerPresenceSummary(cs[idx].NodeID))
+				}
+			}
 			contactsList.Refresh()
 		}
 	}()
@@ -480,6 +563,12 @@ func (s *state) loadLocalState() error {
 	if st.Pending == nil {
 		st.Pending = map[string]bool{}
 	}
+	if st.Delivered == nil {
+		st.Delivered = map[string]bool{}
+	}
+	if st.ReadByPeer == nil {
+		st.ReadByPeer = map[string]bool{}
+	}
 	if st.ActiveGroups == nil {
 		st.ActiveGroups = map[string]groupRoom{}
 	}
@@ -607,6 +696,7 @@ func (s *state) refreshConversation(c peerContact, out *widget.Entry) error {
 		return err
 	}
 	lines := make([]string, 0, len(ledger.Messages))
+	lastIncomingID := ""
 	for _, m := range ledger.Messages {
 		if m.Type == "ack" {
 			continue
@@ -626,14 +716,29 @@ func (s *state) refreshConversation(c peerContact, out *widget.Entry) error {
 		from := "Me"
 		if m.From != s.id.NodeID {
 			from = c.NodeName
+			lastIncomingID = m.ID
 		}
-		lines = append(lines, fmt.Sprintf("[%s] %s: %s", m.CreatedAt, from, msg.Text))
+		stateMark := ""
+		if m.From == s.id.NodeID {
+			if s.local.ReadByPeer[m.ID] {
+				stateMark = " [read]"
+			} else if s.local.Delivered[m.ID] {
+				stateMark = " [delivered]"
+			} else if s.local.Pending[m.ID] {
+				stateMark = " [sending]"
+			}
+		}
+		lines = append(lines, fmt.Sprintf("[%s] %s: %s%s", m.CreatedAt, from, msg.Text, stateMark))
 	}
 	out.SetText(strings.Join(lines, "\n"))
+	if lastIncomingID != "" {
+		_ = s.publishReadReceipt(c, lastIncomingID)
+	}
 	return nil
 }
 
 func (s *state) syncInboxAndRequests(win fyne.Window, msgOut *widget.Entry, selected int) error {
+	_ = s.checkCallSignals(win)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	raw, err := s.client.DHTGet(ctx, requestKey(s.id.NodeID))
@@ -682,6 +787,11 @@ func (s *state) syncContactLedger(c peerContact) error {
 	for _, m := range ledger.Messages {
 		if m.Type == "ack" {
 			delete(s.local.Pending, m.AckFor)
+			s.local.Delivered[m.AckFor] = true
+			continue
+		}
+		if m.Type == "read" {
+			s.local.ReadByPeer[m.AckFor] = true
 			continue
 		}
 		if s.local.SeenMessage[m.ID] {
@@ -767,7 +877,188 @@ func (s *state) createGroup(name string) error {
 	_ = s.saveLocalState()
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	return s.client.DHTPut(ctx, groupKey(id), marshalJSON(gr))
+	ledger := groupLedger{
+		GroupID: id, UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		Events: []groupEvent{{
+			ID: fmt.Sprintf("gev-%d", time.Now().UnixNano()), GroupID: id, Type: "create",
+			ActorID: s.id.NodeID, Payload: name, CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		}},
+	}
+	return s.client.DHTPut(ctx, groupKey(id), marshalJSON(ledger))
+}
+
+func (s *state) groupMemberChange(groupID, targetID, action string) error {
+	if groupID == "" || targetID == "" {
+		return fmt.Errorf("group id and target node id required")
+	}
+	if action != "add" && action != "remove" && action != "promote" && action != "demote" {
+		return fmt.Errorf("invalid group action")
+	}
+	ledger, err := s.loadGroupLedger(groupID)
+	if err != nil {
+		return err
+	}
+	ledger.Events = append(ledger.Events, groupEvent{
+		ID: fmt.Sprintf("gev-%d", time.Now().UnixNano()), GroupID: groupID, Type: action,
+		ActorID: s.id.NodeID, TargetID: targetID, CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	ledger.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return s.saveGroupLedger(groupID, ledger)
+}
+
+func (s *state) publishGroupMessage(groupID, text string) error {
+	if groupID == "" || text == "" {
+		return fmt.Errorf("group id and text required")
+	}
+	ledger, err := s.loadGroupLedger(groupID)
+	if err != nil {
+		return err
+	}
+	ledger.Events = append(ledger.Events, groupEvent{
+		ID: fmt.Sprintf("gev-%d", time.Now().UnixNano()), GroupID: groupID, Type: "msg",
+		ActorID: s.id.NodeID, Payload: text, CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+	ledger.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return s.saveGroupLedger(groupID, ledger)
+}
+
+func (s *state) loadGroupLedger(groupID string) (groupLedger, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	var ledger groupLedger
+	raw, err := s.client.DHTGet(ctx, groupKey(groupID))
+	if err == nil && len(raw) > 0 {
+		_ = json.Unmarshal(raw, &ledger)
+	}
+	if ledger.GroupID == "" {
+		ledger.GroupID = groupID
+		ledger.Events = []groupEvent{}
+	}
+	return ledger, nil
+}
+
+func (s *state) saveGroupLedger(groupID string, ledger groupLedger) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	return s.client.DHTPut(ctx, groupKey(groupID), marshalJSON(ledger))
+}
+
+func (s *state) publishReadReceipt(c peerContact, msgID string) error {
+	ack := makeAckMessage(msgID, s.id.NodeID, c.NodeID)
+	ack.Type = "read"
+	return s.publishEnvelope(c, ack)
+}
+
+func (s *state) publishPresence() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	ps := presenceState{
+		NodeID: s.id.NodeID, NodeName: s.name, DeviceID: s.id.NodeID, Status: "online",
+		LastSeen: time.Now().UTC().Format(time.RFC3339), Transport: "vx6",
+	}
+	return s.client.DHTPut(ctx, presenceKey(s.id.NodeID), marshalJSON(ps))
+}
+
+func (s *state) peerPresenceSummary(nodeID string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	raw, err := s.client.DHTGet(ctx, presenceKey(nodeID))
+	if err != nil || len(raw) == 0 {
+		return "offline/unknown"
+	}
+	var ps presenceState
+	if err := json.Unmarshal(raw, &ps); err != nil {
+		return "offline/unknown"
+	}
+	return ps.Status + " @ " + ps.LastSeen
+}
+
+func (s *state) publishTyping(toNodeID string, typing bool) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ts := typingState{
+		From: s.id.NodeID, To: toNodeID, IsTyping: typing, UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	return s.client.DHTPut(ctx, typingKey(s.id.NodeID, toNodeID), marshalJSON(ts))
+}
+
+func (s *state) typingSummary(peerNodeID string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	raw, err := s.client.DHTGet(ctx, typingKey(s.id.NodeID, peerNodeID))
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+	var ts typingState
+	if err := json.Unmarshal(raw, &ts); err != nil {
+		return ""
+	}
+	if ts.From == peerNodeID && ts.IsTyping {
+		return "Typing..."
+	}
+	return ""
+}
+
+func (s *state) sendCallSignal(c peerContact, action string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	sig := callSignal{
+		ID: fmt.Sprintf("call-%d", time.Now().UnixNano()), FromID: s.id.NodeID, FromName: s.name,
+		ToID: c.NodeID, Action: action, CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	return s.client.DHTPut(ctx, callSignalKey(c.NodeID), marshalJSON(sig))
+}
+
+func (s *state) checkCallSignals(win fyne.Window) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	raw, err := s.client.DHTGet(ctx, callSignalKey(s.id.NodeID))
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var sig callSignal
+	if err := json.Unmarshal(raw, &sig); err != nil {
+		return nil
+	}
+	if sig.ToID != s.id.NodeID || sig.Action != "invite" {
+		return nil
+	}
+	fyne.Do(func() {
+		dialog.ShowConfirm("Incoming Call", sig.FromName+" is inviting you to a VX6 call. Accept signaling?", func(ok bool) {
+			_ = ok // media plane hookup is next phase
+		}, win)
+	})
+	return nil
+}
+
+func (s *state) listReceivedFiles(limit int) ([]string, error) {
+	store, err := config.NewStore(s.client.ConfigPath())
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		return nil, err
+	}
+	root := cfg.Node.DownloadDir
+	if root == "" {
+		root, _ = config.DefaultDownloadDir()
+	}
+	entries := make([]string, 0, limit)
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d == nil || d.IsDir() {
+			return nil
+		}
+		entries = append(entries, path)
+		if len(entries) >= limit {
+			return fmt.Errorf("stop")
+		}
+		return nil
+	})
+	if len(entries) == 0 {
+		return []string{"(no files yet)"}, nil
+	}
+	return entries, nil
 }
 
 func refreshMyInfo(s *state, out *widget.Entry) {
