@@ -212,6 +212,7 @@ func main() {
 	typingLabel := widget.NewLabel("")
 	presenceLabel := widget.NewLabel("Presence: unknown")
 	callDiagLabel := widget.NewLabel("Call: idle")
+	deviceTestLabel := widget.NewLabel("Device test: not run")
 
 	chatInput.OnChanged = func(_ string) {
 		idx := int(atomic.LoadInt32(&st.selected))
@@ -375,6 +376,28 @@ func main() {
 		_ = st.saveLocalState()
 		dialog.ShowInformation("Call Settings", "Saved call/media settings.", w)
 	})
+	deviceTestBtn := widget.NewButton("Run Device Test", func() {
+		st.local.Media.FFmpegPath = strings.TrimSpace(ffmpegPathIn.Text)
+		st.local.Media.VideoDevice = strings.TrimSpace(videoDevSel.Selected)
+		st.local.Media.AudioDevice = strings.TrimSpace(audioDevSel.Selected)
+		st.local.Media.Width, st.local.Media.Height = parseResolution(resIn.Text, st.local.Media.Width, st.local.Media.Height)
+		st.local.Media.FPS = parseIntOr(fpsIn.Text, st.local.Media.FPS)
+		st.local.Media.VideoBitrateKbps = parseIntOr(vbIn.Text, st.local.Media.VideoBitrateKbps)
+		st.local.Media.AudioBitrateKbps = parseIntOr(abIn.Text, st.local.Media.AudioBitrateKbps)
+		deviceTestLabel.SetText("Device test: running...")
+		go func() {
+			rep, err := st.runDeviceTest(st.local.Media)
+			fyne.Do(func() {
+				if err != nil {
+					deviceTestLabel.SetText("Device test: failed")
+					dialog.ShowError(err, w)
+					return
+				}
+				deviceTestLabel.SetText("Device test: ok")
+				dialog.ShowInformation("Device Test Result", rep, w)
+			})
+		}()
+	})
 
 	mediaList := widget.NewList(
 		func() int {
@@ -463,7 +486,7 @@ func main() {
 
 	centerPanel := container.NewVBox(
 		widget.NewCard("Conversation", "", chatLog),
-		widget.NewCard("Status", "", container.NewVBox(presenceLabel, typingLabel, callDiagLabel)),
+		widget.NewCard("Status", "", container.NewVBox(presenceLabel, typingLabel, callDiagLabel, deviceTestLabel)),
 		container.NewGridWithColumns(2, sendBtn, syncBtn),
 		chatInput,
 	)
@@ -479,7 +502,7 @@ func main() {
 		)),
 		widget.NewCard("Calls", "", container.NewVBox(
 			callBtn, ffmpegPathIn, refreshDevicesBtn, videoDevSel, audioDevSel, resIn, fpsIn, vbIn, abIn,
-			turnURLIn, turnUserIn, turnPassIn, turnSecretIn, turnTTLIn, turnRotateIn, useRESTChk, saveCallCfgBtn,
+			turnURLIn, turnUserIn, turnPassIn, turnSecretIn, turnTTLIn, turnRotateIn, useRESTChk, saveCallCfgBtn, deviceTestBtn,
 		)),
 	)
 

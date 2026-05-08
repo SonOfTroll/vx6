@@ -42,6 +42,10 @@ Native desktop communications app over VX6 SDK (Linux-first baseline).
   - active ledger trimmed
   - older message chunks archived with gzip under local `archives/`
 - Call diagnostics label (PeerConnection/ICE state)
+- Device Test button:
+  - probes camera input
+  - probes microphone input
+  - displays mic level summary from ffmpeg output
 - Call settings UI for:
   - ffmpeg path
   - device input selection (dropdown enumeration + refresh)
