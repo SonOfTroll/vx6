@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image/color"
@@ -43,6 +45,12 @@ type state struct {
 	mediaSel int32
 }
 
+type mediaIndexEntry struct {
+	Path      string `json:"path"`
+	PeerNode  string `json:"peer_node"`
+	UpdatedAt string `json:"updated_at"`
+}
+
 func main() {
 	mode := modeOpen
 	if len(os.Args) > 1 && strings.TrimSpace(os.Args[1]) == "org" {
@@ -61,6 +69,7 @@ func main() {
 			ActiveGroups: map[string]groupRoom{},
 			SendSeq:      map[string]uint64{},
 			RecvSeq:      map[string]uint64{},
+			Sessions:     map[string]sessionState{},
 		},
 		selected: -1,
 		mediaSel: -1,
@@ -79,6 +88,7 @@ func main() {
 	st.client = client
 	_ = st.loadIdentityAndConfig()
 
+	logo := widget.NewIcon(theme.ComputerIcon())
 	topTitle := widget.NewLabelWithStyle("VX6 Comms", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 	topSub := widget.NewLabel("Secure decentralized chat with invites, retries, ack tracking, and media transfer")
 	statusLabel := widget.NewLabel("Status: idle")
@@ -274,12 +284,12 @@ func main() {
 
 	mediaList := widget.NewList(
 		func() int {
-			items, _ := st.listReceivedFiles(40)
+			items, _ := st.listReceivedFilesForSelectedContact(40)
 			return len(items)
 		},
 		func() fyne.CanvasObject { return widget.NewLabel("file") },
 		func(i widget.ListItemID, o fyne.CanvasObject) {
-			items, _ := st.listReceivedFiles(40)
+			items, _ := st.listReceivedFilesForSelectedContact(40)
 			if i < 0 || i >= len(items) {
 				return
 			}
@@ -291,7 +301,7 @@ func main() {
 	}
 	refreshMediaBtn := widget.NewButton("Refresh Inbox", func() { mediaList.Refresh() })
 	previewMediaBtn := widget.NewButton("Preview/Open", func() {
-		items, _ := st.listReceivedFiles(80)
+		items, _ := st.listReceivedFilesForSelectedContact(80)
 		idx := int(atomic.LoadInt32(&st.mediaSel))
 		if idx < 0 || idx >= len(items) || items[idx] == "(no files yet)" {
 			dialog.ShowInformation("Media", "Select a file first.", w)
@@ -382,7 +392,7 @@ func main() {
 	mainSplit.Offset = 0.28
 
 	root := container.NewBorder(
-		container.NewVBox(topTitle, topSub),
+		container.NewVBox(container.NewHBox(logo, topTitle), topSub),
 		container.NewHBox(layout.NewSpacer(), widget.NewLabel("VX6 Comms UI")),
 		nil, nil,
 		mainSplit,
@@ -461,6 +471,7 @@ func (s *state) initAndStart(name, email, phone string) error {
 	s.name = name
 	s.mu.Unlock()
 	s.saveProfileMeta(email, phone)
+	_ = s.ensureAndPublishX3DH()
 	return s.startNode()
 }
 
@@ -546,6 +557,10 @@ func (s *state) statePath() string {
 	return filepath.Join(filepath.Dir(s.client.ConfigPath()), "vx6comms-state.json")
 }
 
+func (s *state) mediaIndexPath() string {
+	return filepath.Join(filepath.Dir(s.client.ConfigPath()), "vx6comms-media-index.json")
+}
+
 func (s *state) loadContacts() error {
 	data, err := os.ReadFile(s.contactsPath())
 	if err != nil {
@@ -595,6 +610,9 @@ func (s *state) loadLocalState() error {
 	}
 	if st.RecvSeq == nil {
 		st.RecvSeq = map[string]uint64{}
+	}
+	if st.Sessions == nil {
+		st.Sessions = map[string]sessionState{}
 	}
 	s.local = st
 	return nil
@@ -651,12 +669,20 @@ func (s *state) acceptInvite(link string) error {
 }
 
 func (s *state) sendMessage(c peerContact, text string) error {
-	seq := s.local.SendSeq[c.NodeID] + 1
-	env, err := sealMessage(c.Secret, chatMessage{Text: text}, s.id.NodeID, c.NodeID, "msg", seq)
+	ss, err := s.ensureSessionWith(c)
 	if err != nil {
 		return err
 	}
-	s.local.SendSeq[c.NodeID] = seq
+	ss.SendSeq++
+	nextCK, mk := hkdfStep(mustDecode(ss.SendCK), "send")
+	ss.SendCK = mustEncode(nextCK)
+	ss.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	seq := ss.SendSeq
+	env, err := sealMessageWithKey(mk, chatMessage{Text: text}, s.id.NodeID, c.NodeID, "msg", seq)
+	if err != nil {
+		return err
+	}
+	s.local.Sessions[c.NodeID] = ss
 	if err := s.publishEnvelope(c, env); err != nil {
 		s.queueMessage(c.NodeID, env, 1)
 		return err
@@ -735,7 +761,7 @@ func (s *state) refreshConversation(c peerContact, out *widget.Entry) error {
 			lines = append(lines, fmt.Sprintf("[%s] %s shared file: %s (%d bytes)", m.CreatedAt, src, m.MediaName, m.MediaSize))
 			continue
 		}
-		msg, err := openMessage(c.Secret, m)
+		msg, err := s.openMessageForContact(c, m)
 		if err != nil {
 			continue
 		}
@@ -761,6 +787,46 @@ func (s *state) refreshConversation(c peerContact, out *widget.Entry) error {
 		_ = s.publishReadReceipt(c, lastIncomingID)
 	}
 	return nil
+}
+
+func (s *state) openMessageForContact(c peerContact, env messageEnvelope) (chatMessage, error) {
+	ss, err := s.ensureSessionWith(c)
+	if err != nil {
+		return chatMessage{}, err
+	}
+	for i, sk := range ss.Skipped {
+		if sk.Seq == env.Seq {
+			msg, err := openMessageWithKey(mustDecode(sk.Key), env)
+			if err == nil {
+				ss.Skipped = append(ss.Skipped[:i], ss.Skipped[i+1:]...)
+				s.local.Sessions[c.NodeID] = ss
+				return msg, nil
+			}
+		}
+	}
+	if env.From == c.NodeID {
+		for ss.RecvSeq < env.Seq {
+			ss.RecvSeq++
+			nextCK, mk := hkdfStep(mustDecode(ss.RecvCK), "recv")
+			ss.RecvCK = mustEncode(nextCK)
+			if ss.RecvSeq == env.Seq {
+				msg, err := openMessageWithKey(mk, env)
+				if err == nil {
+					s.local.Sessions[c.NodeID] = ss
+					return msg, nil
+				}
+			} else {
+				ss.Skipped = append(ss.Skipped, skippedKey{Seq: ss.RecvSeq, Key: mustEncode(mk)})
+				if len(ss.Skipped) > 64 {
+					ss.Skipped = ss.Skipped[len(ss.Skipped)-64:]
+				}
+			}
+		}
+	}
+	if msg, err := openMessage(c.Secret, env); err == nil {
+		return msg, nil
+	}
+	return chatMessage{}, fmt.Errorf("decrypt failed")
 }
 
 func (s *state) syncInboxAndRequests(win fyne.Window, msgOut *widget.Entry, selected int) error {
@@ -1132,21 +1198,166 @@ func (s *state) listReceivedFiles(limit int) ([]string, error) {
 		root, _ = config.DefaultDownloadDir()
 	}
 	entries := make([]string, 0, limit)
+	index := make([]mediaIndexEntry, 0, limit)
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d == nil || d.IsDir() {
 			return nil
 		}
 		entries = append(entries, path)
+		peer := ""
+		parts := strings.Split(path, string(os.PathSeparator))
+		for _, p := range parts {
+			if strings.Contains(p, "_vx6") {
+				segs := strings.Split(p, "_")
+				if len(segs) >= 2 {
+					peer = segs[len(segs)-2]
+				}
+			}
+		}
+		index = append(index, mediaIndexEntry{Path: path, PeerNode: peer, UpdatedAt: time.Now().UTC().Format(time.RFC3339)})
 		if len(entries) >= limit {
 			return fmt.Errorf("stop")
 		}
 		return nil
 	})
+	_ = os.WriteFile(s.mediaIndexPath(), marshalJSON(index), 0o644)
 	if len(entries) == 0 {
 		return []string{"(no files yet)"}, nil
 	}
 	return entries, nil
 }
+
+func (s *state) listReceivedFilesForSelectedContact(limit int) ([]string, error) {
+	items, err := s.listReceivedFiles(limit * 2)
+	if err != nil || len(items) == 0 || items[0] == "(no files yet)" {
+		return items, err
+	}
+	idx := int(atomic.LoadInt32(&s.selected))
+	cs := s.sortedContacts()
+	if idx < 0 || idx >= len(cs) {
+		return items, nil
+	}
+	id := cs[idx].NodeID
+	filtered := make([]string, 0, len(items))
+	for _, p := range items {
+		if strings.Contains(p, id) {
+			filtered = append(filtered, p)
+		}
+	}
+	if len(filtered) == 0 {
+		return []string{"(no files for selected contact)"}, nil
+	}
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+	return filtered, nil
+}
+
+func (s *state) ensureAndPublishX3DH() error {
+	if s.local.Prekeys.IdentitySK == "" {
+		idSK, idPK, err := newX25519Keypair()
+		if err != nil {
+			return err
+		}
+		spSK, spPK, err := newX25519Keypair()
+		if err != nil {
+			return err
+		}
+		s.local.Prekeys.IdentitySK = idSK
+		s.local.Prekeys.IdentityPK = idPK
+		s.local.Prekeys.SignedSK = spSK
+		s.local.Prekeys.SignedPK = spPK
+		for i := 0; i < 8; i++ {
+			sk, pk, err := newX25519Keypair()
+			if err != nil {
+				return err
+			}
+			s.local.Prekeys.OneTimeSKs = append(s.local.Prekeys.OneTimeSKs, sk)
+			s.local.Prekeys.OneTimePKs = append(s.local.Prekeys.OneTimePKs, pk)
+		}
+	}
+	_ = s.saveLocalState()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b := x3dhBundle{
+		OwnerNodeID: s.id.NodeID,
+		IdentityPK:  s.local.Prekeys.IdentityPK,
+		SignedPrePK: s.local.Prekeys.SignedPK,
+		OneTimePKs:  append([]string(nil), s.local.Prekeys.OneTimePKs...),
+		UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	return s.client.DHTPut(ctx, x3dhBundleKey(s.id.NodeID), marshalJSON(b))
+}
+
+func (s *state) ensureSessionWith(c peerContact) (sessionState, error) {
+	if ss, ok := s.local.Sessions[c.NodeID]; ok && ss.RootKey != "" {
+		return ss, nil
+	}
+	_ = s.ensureAndPublishX3DH()
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	raw, err := s.client.DHTGet(ctx, x3dhBundleKey(c.NodeID))
+	if err != nil || len(raw) == 0 {
+		seed := sha256.Sum256([]byte("vx6-fallback\n" + c.Secret + "\n" + s.id.NodeID + "\n" + c.NodeID))
+		ss := sessionState{
+			PeerNodeID: c.NodeID, RootKey: mustEncode(seed[:]), SendCK: mustEncode(seed[:]), RecvCK: mustEncode(seed[:]),
+			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		s.local.Sessions[c.NodeID] = ss
+		_ = s.saveLocalState()
+		return ss, nil
+	}
+	var b x3dhBundle
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return sessionState{}, err
+	}
+	otpk := b.SignedPrePK
+	if len(b.OneTimePKs) > 0 {
+		otpk = b.OneTimePKs[0]
+	}
+	ephSK, ephPK, err := newX25519Keypair()
+	if err != nil {
+		return sessionState{}, err
+	}
+	_ = ephPK
+	dh1, err := ecdhShared(s.local.Prekeys.IdentitySK, b.SignedPrePK)
+	if err != nil {
+		return sessionState{}, err
+	}
+	dh2, err := ecdhShared(ephSK, b.IdentityPK)
+	if err != nil {
+		return sessionState{}, err
+	}
+	dh3, err := ecdhShared(ephSK, b.SignedPrePK)
+	if err != nil {
+		return sessionState{}, err
+	}
+	dh4, err := ecdhShared(ephSK, otpk)
+	if err != nil {
+		return sessionState{}, err
+	}
+	h := sha256.New()
+	_, _ = h.Write(dh1)
+	_, _ = h.Write(dh2)
+	_, _ = h.Write(dh3)
+	_, _ = h.Write(dh4)
+	rk := h.Sum(nil)
+	sck, _ := hkdfStep(rk, "send-init")
+	rck, _ := hkdfStep(rk, "recv-init")
+	ss := sessionState{
+		PeerNodeID: c.NodeID, RootKey: mustEncode(rk), SendCK: mustEncode(sck), RecvCK: mustEncode(rck),
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	s.local.Sessions[c.NodeID] = ss
+	_ = s.saveLocalState()
+	return ss, nil
+}
+
+func mustDecode(sv string) []byte {
+	b, _ := base64.RawURLEncoding.DecodeString(sv)
+	return b
+}
+func mustEncode(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
 
 func (s *state) showMediaPreview(path string, win fyne.Window) {
 	ext := strings.ToLower(filepath.Ext(path))

@@ -36,6 +36,7 @@ Native desktop communications app over VX6 SDK (Linux-first baseline).
 - Group room metadata publish (foundation for expanded group chat)
 - Group event ledger with membership and role actions (`add/remove/promote/demote`) + group message events
 - Media inbox browser from configured downloads directory
+- Media index file stored locally (`vx6comms-media-index.json`) so files remain visible in filesystem and app
 - Periodic sync of requests/conversations + retry pump
 
 ## Build (Linux)
@@ -73,6 +74,5 @@ Windows/macOS binaries can be cross-built, but native packaging/signing and plat
 - No central server is required for basic peer chat flow.
 - True phone/email OTP verification cannot be trustless without a verification service; current profile fields are metadata only.
 - Remaining for full Signal/Tor-grade chat parity:
-  - X3DH prekey bundles + true Double Ratchet (DH ratchet + skipped message key handling)
   - Full RTP/WebRTC media transport (beyond current decentralized call signaling)
-  - richer media previews/stream playback controls
+  - richer video playback controls/stream pipeline

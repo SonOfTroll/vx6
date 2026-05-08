@@ -3,6 +3,8 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ecdh"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -81,16 +83,51 @@ type queuedMessage struct {
 }
 
 type localState struct {
-	Unread       map[string]int       `json:"unread"`
-	SeenMessage  map[string]bool      `json:"seen_message"`
-	Pending      map[string]bool      `json:"pending"`
-	Delivered    map[string]bool      `json:"delivered"`
-	ReadByPeer   map[string]bool      `json:"read_by_peer"`
-	Outbox       []queuedMessage      `json:"outbox"`
-	LastSyncAt   string               `json:"last_sync_at"`
-	ActiveGroups map[string]groupRoom `json:"active_groups"`
-	SendSeq      map[string]uint64    `json:"send_seq"`
-	RecvSeq      map[string]uint64    `json:"recv_seq"`
+	Unread       map[string]int          `json:"unread"`
+	SeenMessage  map[string]bool         `json:"seen_message"`
+	Pending      map[string]bool         `json:"pending"`
+	Delivered    map[string]bool         `json:"delivered"`
+	ReadByPeer   map[string]bool         `json:"read_by_peer"`
+	Outbox       []queuedMessage         `json:"outbox"`
+	LastSyncAt   string                  `json:"last_sync_at"`
+	ActiveGroups map[string]groupRoom    `json:"active_groups"`
+	SendSeq      map[string]uint64       `json:"send_seq"`
+	RecvSeq      map[string]uint64       `json:"recv_seq"`
+	Sessions     map[string]sessionState `json:"sessions"`
+	Prekeys      x3dhPrekeys             `json:"prekeys"`
+}
+
+type x3dhBundle struct {
+	OwnerNodeID string   `json:"owner_node_id"`
+	IdentityPK  string   `json:"identity_pk"`
+	SignedPrePK string   `json:"signed_pre_pk"`
+	OneTimePKs  []string `json:"one_time_pks"`
+	UpdatedAt   string   `json:"updated_at"`
+}
+
+type x3dhPrekeys struct {
+	IdentitySK string   `json:"identity_sk"`
+	IdentityPK string   `json:"identity_pk"`
+	SignedSK   string   `json:"signed_sk"`
+	SignedPK   string   `json:"signed_pk"`
+	OneTimeSKs []string `json:"one_time_sks"`
+	OneTimePKs []string `json:"one_time_pks"`
+}
+
+type skippedKey struct {
+	Seq uint64 `json:"seq"`
+	Key string `json:"key"`
+}
+
+type sessionState struct {
+	PeerNodeID string       `json:"peer_node_id"`
+	RootKey    string       `json:"root_key"`
+	SendCK     string       `json:"send_ck"`
+	RecvCK     string       `json:"recv_ck"`
+	SendSeq    uint64       `json:"send_seq"`
+	RecvSeq    uint64       `json:"recv_seq"`
+	Skipped    []skippedKey `json:"skipped"`
+	UpdatedAt  string       `json:"updated_at"`
 }
 
 type presenceState struct {
@@ -162,6 +199,10 @@ func callSignalKey(nodeID string) string {
 	return "vx6chat/call/" + nodeID
 }
 
+func x3dhBundleKey(nodeID string) string {
+	return "vx6chat/x3dh/" + nodeID
+}
+
 func marshalJSON(v any) []byte {
 	out, _ := json.Marshal(v)
 	return out
@@ -210,6 +251,65 @@ func makeAckMessage(ackedID, from, to string) messageEnvelope {
 	}
 }
 
+func sealMessageWithKey(msgKey []byte, plain chatMessage, from, to, kind string, seq uint64) (messageEnvelope, error) {
+	raw, err := json.Marshal(plain)
+	if err != nil {
+		return messageEnvelope{}, err
+	}
+	block, err := aes.NewCipher(msgKey[:32])
+	if err != nil {
+		return messageEnvelope{}, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return messageEnvelope{}, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return messageEnvelope{}, err
+	}
+	ciphertext := gcm.Seal(nil, nonce, raw, []byte(from+"\n"+to))
+	sum := sha256.Sum256(append(nonce, ciphertext...))
+	return messageEnvelope{
+		ID:        base64.RawURLEncoding.EncodeToString(sum[:12]),
+		Type:      kind,
+		Seq:       seq,
+		From:      from,
+		To:        to,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		Nonce:     base64.RawURLEncoding.EncodeToString(nonce),
+		Cipher:    base64.RawURLEncoding.EncodeToString(ciphertext),
+	}, nil
+}
+
+func openMessageWithKey(msgKey []byte, env messageEnvelope) (chatMessage, error) {
+	block, err := aes.NewCipher(msgKey[:32])
+	if err != nil {
+		return chatMessage{}, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return chatMessage{}, err
+	}
+	nonce, err := base64.RawURLEncoding.DecodeString(env.Nonce)
+	if err != nil {
+		return chatMessage{}, err
+	}
+	ciphertext, err := base64.RawURLEncoding.DecodeString(env.Cipher)
+	if err != nil {
+		return chatMessage{}, err
+	}
+	plain, err := gcm.Open(nil, nonce, ciphertext, []byte(env.From+"\n"+env.To))
+	if err != nil {
+		return chatMessage{}, err
+	}
+	var msg chatMessage
+	if err := json.Unmarshal(plain, &msg); err != nil {
+		return chatMessage{}, err
+	}
+	return msg, nil
+}
+
 func openMessage(secret string, env messageEnvelope) (chatMessage, error) {
 	key := deriveMessageKey(secret, env.From, env.To, env.Seq)
 	block, err := aes.NewCipher(key)
@@ -242,6 +342,46 @@ func openMessage(secret string, env messageEnvelope) (chatMessage, error) {
 func deriveMessageKey(secret, from, to string, seq uint64) []byte {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("vx6-ratchet-v1\n%s\n%s\n%s\n%d", secret, from, to, seq)))
 	return sum[:]
+}
+
+func hkdfStep(chainKey []byte, label string) (nextCK []byte, mk []byte) {
+	h1 := hmac.New(sha256.New, chainKey)
+	_, _ = h1.Write([]byte(label + "/ck"))
+	nextCK = h1.Sum(nil)
+	h2 := hmac.New(sha256.New, chainKey)
+	_, _ = h2.Write([]byte(label + "/mk"))
+	mk = h2.Sum(nil)
+	return nextCK, mk
+}
+
+func newX25519Keypair() (privB64, pubB64 string, err error) {
+	curve := ecdh.X25519()
+	sk, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(sk.Bytes()), base64.RawURLEncoding.EncodeToString(sk.PublicKey().Bytes()), nil
+}
+
+func ecdhShared(privB64, pubB64 string) ([]byte, error) {
+	curve := ecdh.X25519()
+	privRaw, err := base64.RawURLEncoding.DecodeString(privB64)
+	if err != nil {
+		return nil, err
+	}
+	pubRaw, err := base64.RawURLEncoding.DecodeString(pubB64)
+	if err != nil {
+		return nil, err
+	}
+	sk, err := curve.NewPrivateKey(privRaw)
+	if err != nil {
+		return nil, err
+	}
+	pk, err := curve.NewPublicKey(pubRaw)
+	if err != nil {
+		return nil, err
+	}
+	return sk.ECDH(pk)
 }
 
 func randomSecret() (string, error) {
