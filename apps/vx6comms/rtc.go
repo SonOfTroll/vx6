@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +37,8 @@ type rtcSession struct {
 	pc        *webrtc.PeerConnection
 	videoSSRC uint32
 	audioSSRC uint32
+	videoKbps int
+	lastTune  time.Time
 	ffmpegCmd *exec.Cmd
 	stop      context.CancelFunc
 	lastSigID string
@@ -54,11 +60,12 @@ func (s *state) ensureRTCSession(peer peerContact) (*rtcSession, error) {
 	}
 
 	pcCfg := webrtc.Configuration{}
+	turnUser, turnPass := s.resolveTURNCredentials()
 	if strings.TrimSpace(s.local.Turn.URL) != "" {
 		pcCfg.ICEServers = []webrtc.ICEServer{{
 			URLs:       []string{strings.TrimSpace(s.local.Turn.URL)},
-			Username:   strings.TrimSpace(s.local.Turn.Username),
-			Credential: s.local.Turn.Password,
+			Username:   turnUser,
+			Credential: turnPass,
 		}}
 	}
 	pc, err := webrtc.NewPeerConnection(pcCfg)
@@ -70,6 +77,7 @@ func (s *state) ensureRTCSession(peer peerContact) (*rtcSession, error) {
 		pc:        pc,
 		videoSSRC: 424242,
 		audioSSRC: 525252,
+		videoKbps: s.local.Media.VideoBitrateKbps,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	ss.stop = cancel
@@ -112,6 +120,7 @@ func (s *state) ensureRTCSession(peer peerContact) (*rtcSession, error) {
 	_, _ = pc.AddTrack(videoTrack)
 	_, _ = pc.AddTrack(audioTrack)
 	go s.startCapturePipeline(ctx, ss, videoTrack, audioTrack, s.local.Media)
+	go s.monitorAdaptiveBitrate(ctx, ss)
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -329,10 +338,15 @@ func buildFFmpegCaptureCommand(videoPort, audioPort int, cfg mediaConfig) *exec.
 			"-s", fmt.Sprintf("%dx%d", width, height),
 		})
 	case "windows":
-		in := cfg.VideoDevice
-		if strings.TrimSpace(in) == "" {
-			in = "video=default:audio=default"
+		vdev := strings.TrimSpace(cfg.VideoDevice)
+		adev := strings.TrimSpace(cfg.AudioDevice)
+		if vdev == "" {
+			vdev = "default"
 		}
+		if adev == "" {
+			adev = "default"
+		}
+		in := fmt.Sprintf("video=%s:audio=%s", vdev, adev)
 		return build([]string{
 			"-f", "dshow", "-i", in,
 			"-pix_fmt", "yuv420p",
@@ -352,6 +366,141 @@ func buildFFmpegCaptureCommand(videoPort, audioPort int, cfg mediaConfig) *exec.
 		})
 	default:
 		return nil
+	}
+}
+
+func (s *state) resolveTURNCredentials() (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.local.Turn.UseRESTAuth || strings.TrimSpace(s.local.Turn.SharedSecret) == "" {
+		return strings.TrimSpace(s.local.Turn.Username), s.local.Turn.Password
+	}
+	now := time.Now().UTC()
+	last, _ := time.Parse(time.RFC3339, s.local.Turn.LastRotatedAt)
+	rotateEvery := time.Duration(s.local.Turn.MinRotateMinutes) * time.Minute
+	if rotateEvery <= 0 {
+		rotateEvery = 10 * time.Minute
+	}
+	if last.IsZero() || now.Sub(last) >= rotateEvery || s.local.Turn.Username == "" || s.local.Turn.Password == "" {
+		ttl := s.local.Turn.TTLMinutes
+		if ttl <= 0 {
+			ttl = 30
+		}
+		exp := now.Add(time.Duration(ttl) * time.Minute).Unix()
+		username := fmt.Sprintf("%d:%s", exp, s.id.NodeID)
+		mac := hmac.New(sha1.New, []byte(s.local.Turn.SharedSecret))
+		_, _ = mac.Write([]byte(username))
+		credential := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+		s.local.Turn.Username = username
+		s.local.Turn.Password = credential
+		s.local.Turn.LastRotatedAt = now.Format(time.RFC3339)
+		_ = s.saveLocalState()
+	}
+	return strings.TrimSpace(s.local.Turn.Username), s.local.Turn.Password
+}
+
+func (s *state) monitorAdaptiveBitrate(ctx context.Context, ss *rtcSession) {
+	tk := time.NewTicker(5 * time.Second)
+	defer tk.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tk.C:
+			if ss == nil || ss.pc == nil {
+				continue
+			}
+			next := s.nextVideoBitrateKbps(ss)
+			if next == ss.videoKbps {
+				continue
+			}
+			if time.Since(ss.lastTune) < 20*time.Second {
+				continue
+			}
+			ss.lastTune = time.Now()
+			ss.videoKbps = next
+			_ = s.reofferWithBitrate(ss.peerID, next)
+		}
+	}
+}
+
+func (s *state) nextVideoBitrateKbps(ss *rtcSession) int {
+	cur := ss.videoKbps
+	if cur <= 0 {
+		cur = 700
+	}
+	state := ss.pc.ICEConnectionState()
+	if state != webrtc.ICEConnectionStateConnected && state != webrtc.ICEConnectionStateCompleted {
+		if cur > 300 {
+			return cur - 150
+		}
+		return 200
+	}
+	report := ss.pc.GetStats()
+	highLoss := false
+	lowLoss := false
+	for _, st := range report {
+		raw, _ := json.Marshal(st)
+		var m map[string]any
+		if json.Unmarshal(raw, &m) != nil {
+			continue
+		}
+		tp, _ := m["type"].(string)
+		if !strings.Contains(tp, "remote-inbound-rtp") {
+			continue
+		}
+		kind, _ := m["kind"].(string)
+		if kind != "" && kind != "video" {
+			continue
+		}
+		fl := numberAsFloat(m["fractionLost"])
+		if fl > 0.08 {
+			highLoss = true
+		}
+		if fl >= 0 && fl < 0.02 {
+			lowLoss = true
+		}
+	}
+	switch {
+	case highLoss:
+		if cur > 300 {
+			return cur - 120
+		}
+		return 200
+	case lowLoss && cur < 1800:
+		return cur + 80
+	default:
+		return cur
+	}
+}
+
+func (s *state) reofferWithBitrate(peerID string, kbps int) error {
+	peer := s.findContactByID(peerID)
+	if peer.NodeID == "" {
+		return nil
+	}
+	old := s.local.Media.VideoBitrateKbps
+	s.local.Media.VideoBitrateKbps = kbps
+	defer func() { s.local.Media.VideoBitrateKbps = old }()
+	_ = s.saveLocalState()
+	return s.initiateWebRTCCall(peer)
+}
+
+func numberAsFloat(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case float32:
+		return float64(x)
+	case int:
+		return float64(x)
+	case int64:
+		return float64(x)
+	case string:
+		f, _ := strconv.ParseFloat(x, 64)
+		return f
+	default:
+		return -1
 	}
 }
 

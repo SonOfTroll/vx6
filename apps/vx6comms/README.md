@@ -44,10 +44,18 @@ Native desktop communications app over VX6 SDK (Linux-first baseline).
 - Call diagnostics label (PeerConnection/ICE state)
 - Call settings UI for:
   - ffmpeg path
-  - device input selection
+  - device input selection (dropdown enumeration + refresh)
   - resolution/fps
   - bitrate controls
   - TURN URL/credentials
+  - TURN REST shared-secret rotation settings
+- TURN hardening:
+  - optional REST-auth ephemeral credentials (`exp:nodeid` + HMAC secret)
+  - configurable credential TTL + rotation interval
+- Adaptive bitrate loop:
+  - monitors WebRTC stats
+  - reduces bitrate on loss/disconnect pressure
+  - increases bitrate slowly on stable conditions
 - Periodic sync of requests/conversations + retry pump
 
 ## Build (Linux)

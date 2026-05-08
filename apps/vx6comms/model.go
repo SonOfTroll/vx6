@@ -111,9 +111,14 @@ type mediaConfig struct {
 }
 
 type turnConfig struct {
-	URL      string `json:"url"`
-	Username string `json:"username"`
-	Password string `json:"password"`
+	URL              string `json:"url"`
+	Username         string `json:"username"`
+	Password         string `json:"password"`
+	SharedSecret     string `json:"shared_secret"`
+	UseRESTAuth      bool   `json:"use_rest_auth"`
+	TTLMinutes       int    `json:"ttl_minutes"`
+	LastRotatedAt    string `json:"last_rotated_at"`
+	MinRotateMinutes int    `json:"min_rotate_minutes"`
 }
 
 type x3dhBundle struct {

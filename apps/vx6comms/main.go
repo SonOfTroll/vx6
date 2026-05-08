@@ -10,7 +10,9 @@ import (
 	"image/color"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -301,12 +303,26 @@ func main() {
 	ffmpegPathIn := widget.NewEntry()
 	ffmpegPathIn.SetPlaceHolder("ffmpeg path (optional)")
 	ffmpegPathIn.SetText(st.local.Media.FFmpegPath)
-	videoDevIn := widget.NewEntry()
-	videoDevIn.SetPlaceHolder("Video device (linux default /dev/video0)")
-	videoDevIn.SetText(st.local.Media.VideoDevice)
-	audioDevIn := widget.NewEntry()
-	audioDevIn.SetPlaceHolder("Audio device (linux default pulse:default)")
-	audioDevIn.SetText(st.local.Media.AudioDevice)
+	videoDevices := st.enumerateVideoDevices()
+	audioDevices := st.enumerateAudioDevices()
+	videoDevSel := widget.NewSelect(videoDevices, nil)
+	videoDevSel.PlaceHolder = "Video device"
+	if st.local.Media.VideoDevice != "" {
+		videoDevSel.SetSelected(st.local.Media.VideoDevice)
+	}
+	audioDevSel := widget.NewSelect(audioDevices, nil)
+	audioDevSel.PlaceHolder = "Audio device"
+	if st.local.Media.AudioDevice != "" {
+		audioDevSel.SetSelected(st.local.Media.AudioDevice)
+	}
+	refreshDevicesBtn := widget.NewButton("Refresh Devices", func() {
+		videoDevices = st.enumerateVideoDevices()
+		audioDevices = st.enumerateAudioDevices()
+		videoDevSel.Options = videoDevices
+		audioDevSel.Options = audioDevices
+		videoDevSel.Refresh()
+		audioDevSel.Refresh()
+	})
 	resIn := widget.NewEntry()
 	resIn.SetPlaceHolder("Resolution WxH, e.g. 640x360")
 	resIn.SetText(fmt.Sprintf("%dx%d", st.local.Media.Width, st.local.Media.Height))
@@ -328,11 +344,22 @@ func main() {
 	turnPassIn := widget.NewPasswordEntry()
 	turnPassIn.SetPlaceHolder("TURN password")
 	turnPassIn.SetText(st.local.Turn.Password)
+	turnSecretIn := widget.NewPasswordEntry()
+	turnSecretIn.SetPlaceHolder("TURN shared secret (REST auth)")
+	turnSecretIn.SetText(st.local.Turn.SharedSecret)
+	turnTTLIn := widget.NewEntry()
+	turnTTLIn.SetPlaceHolder("TURN TTL minutes")
+	turnTTLIn.SetText(fmt.Sprintf("%d", st.local.Turn.TTLMinutes))
+	turnRotateIn := widget.NewEntry()
+	turnRotateIn.SetPlaceHolder("Credential rotate minutes")
+	turnRotateIn.SetText(fmt.Sprintf("%d", st.local.Turn.MinRotateMinutes))
+	useRESTChk := widget.NewCheck("Use TURN REST auth rotation", func(bool) {})
+	useRESTChk.SetChecked(st.local.Turn.UseRESTAuth)
 	saveCallCfgBtn := widget.NewButton("Save Call Settings", func() {
 		wv, hv := parseResolution(resIn.Text, st.local.Media.Width, st.local.Media.Height)
 		st.local.Media.FFmpegPath = strings.TrimSpace(ffmpegPathIn.Text)
-		st.local.Media.VideoDevice = strings.TrimSpace(videoDevIn.Text)
-		st.local.Media.AudioDevice = strings.TrimSpace(audioDevIn.Text)
+		st.local.Media.VideoDevice = strings.TrimSpace(videoDevSel.Selected)
+		st.local.Media.AudioDevice = strings.TrimSpace(audioDevSel.Selected)
 		st.local.Media.Width = wv
 		st.local.Media.Height = hv
 		st.local.Media.FPS = parseIntOr(fpsIn.Text, st.local.Media.FPS)
@@ -341,6 +368,10 @@ func main() {
 		st.local.Turn.URL = strings.TrimSpace(turnURLIn.Text)
 		st.local.Turn.Username = strings.TrimSpace(turnUserIn.Text)
 		st.local.Turn.Password = strings.TrimSpace(turnPassIn.Text)
+		st.local.Turn.SharedSecret = strings.TrimSpace(turnSecretIn.Text)
+		st.local.Turn.TTLMinutes = parseIntOr(turnTTLIn.Text, st.local.Turn.TTLMinutes)
+		st.local.Turn.MinRotateMinutes = parseIntOr(turnRotateIn.Text, st.local.Turn.MinRotateMinutes)
+		st.local.Turn.UseRESTAuth = useRESTChk.Checked
 		_ = st.saveLocalState()
 		dialog.ShowInformation("Call Settings", "Saved call/media settings.", w)
 	})
@@ -447,8 +478,8 @@ func main() {
 			groupMsgInput, sendGroupBtn,
 		)),
 		widget.NewCard("Calls", "", container.NewVBox(
-			callBtn, ffmpegPathIn, videoDevIn, audioDevIn, resIn, fpsIn, vbIn, abIn,
-			turnURLIn, turnUserIn, turnPassIn, saveCallCfgBtn,
+			callBtn, ffmpegPathIn, refreshDevicesBtn, videoDevSel, audioDevSel, resIn, fpsIn, vbIn, abIn,
+			turnURLIn, turnUserIn, turnPassIn, turnSecretIn, turnTTLIn, turnRotateIn, useRESTChk, saveCallCfgBtn,
 		)),
 	)
 
@@ -696,6 +727,12 @@ func (s *state) loadLocalState() error {
 	}
 	if st.Media.AudioBitrateKbps <= 0 {
 		st.Media.AudioBitrateKbps = 64
+	}
+	if st.Turn.TTLMinutes <= 0 {
+		st.Turn.TTLMinutes = 30
+	}
+	if st.Turn.MinRotateMinutes <= 0 {
+		st.Turn.MinRotateMinutes = 10
 	}
 	s.local = st
 	return nil
@@ -1544,6 +1581,84 @@ func (s *state) compactConversationLedger(c peerContact) error {
 	ledger.Messages = keep
 	ledger.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	return s.client.DHTPut(ctx, key, marshalJSON(ledger))
+}
+
+func (s *state) enumerateVideoDevices() []string {
+	switch runtime.GOOS {
+	case "linux":
+		matches, _ := filepath.Glob("/dev/video*")
+		if len(matches) == 0 {
+			return []string{"/dev/video0"}
+		}
+		return matches
+	case "darwin":
+		return []string{"0:0", "1:0", "0:1"}
+	case "windows":
+		return parseDeviceNamesFromFFmpeg("video")
+	default:
+		return []string{"default"}
+	}
+}
+
+func (s *state) enumerateAudioDevices() []string {
+	switch runtime.GOOS {
+	case "linux":
+		out, err := exec.Command("pactl", "list", "short", "sources").CombinedOutput()
+		if err == nil {
+			lines := strings.Split(string(out), "\n")
+			opts := []string{}
+			for _, ln := range lines {
+				fields := strings.Fields(ln)
+				if len(fields) > 1 {
+					opts = append(opts, fields[1])
+				}
+			}
+			if len(opts) > 0 {
+				return opts
+			}
+		}
+		return []string{"default"}
+	case "darwin":
+		return []string{"0:0", "0:1", "1:0"}
+	case "windows":
+		return parseDeviceNamesFromFFmpeg("audio")
+	default:
+		return []string{"default"}
+	}
+}
+
+func parseDeviceNamesFromFFmpeg(kind string) []string {
+	ffmpegPath, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return []string{"default"}
+	}
+	out, _ := exec.Command(ffmpegPath, "-list_devices", "true", "-f", "dshow", "-i", "dummy").CombinedOutput()
+	lines := strings.Split(string(out), "\n")
+	opts := []string{}
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if !strings.Contains(ln, "]  \"") {
+			continue
+		}
+		if kind == "video" && !strings.Contains(strings.ToLower(ln), "video") {
+			continue
+		}
+		if kind == "audio" && !strings.Contains(strings.ToLower(ln), "audio") {
+			continue
+		}
+		i := strings.Index(ln, "\"")
+		j := strings.LastIndex(ln, "\"")
+		if i >= 0 && j > i {
+			name := ln[i+1 : j]
+			if name != "" {
+				opts = append(opts, name)
+			}
+		}
+	}
+	if len(opts) == 0 {
+		return []string{"default"}
+	}
+	return opts
 }
 
 func (s *state) showMediaPreview(path string, win fyne.Window) {
