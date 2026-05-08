@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -72,6 +73,13 @@ func main() {
 			SendSeq:      map[string]uint64{},
 			RecvSeq:      map[string]uint64{},
 			Sessions:     map[string]sessionState{},
+			Media: mediaConfig{
+				Width:            640,
+				Height:           360,
+				FPS:              30,
+				VideoBitrateKbps: 700,
+				AudioBitrateKbps: 64,
+			},
 		},
 		selected: -1,
 		mediaSel: -1,
@@ -201,6 +209,7 @@ func main() {
 	chatInput.SetPlaceHolder("Type message")
 	typingLabel := widget.NewLabel("")
 	presenceLabel := widget.NewLabel("Presence: unknown")
+	callDiagLabel := widget.NewLabel("Call: idle")
 
 	chatInput.OnChanged = func(_ string) {
 		idx := int(atomic.LoadInt32(&st.selected))
@@ -288,6 +297,52 @@ func main() {
 			return
 		}
 		dialog.ShowInformation("Call Invite", "Call signal + WebRTC offer sent.", w)
+	})
+	ffmpegPathIn := widget.NewEntry()
+	ffmpegPathIn.SetPlaceHolder("ffmpeg path (optional)")
+	ffmpegPathIn.SetText(st.local.Media.FFmpegPath)
+	videoDevIn := widget.NewEntry()
+	videoDevIn.SetPlaceHolder("Video device (linux default /dev/video0)")
+	videoDevIn.SetText(st.local.Media.VideoDevice)
+	audioDevIn := widget.NewEntry()
+	audioDevIn.SetPlaceHolder("Audio device (linux default pulse:default)")
+	audioDevIn.SetText(st.local.Media.AudioDevice)
+	resIn := widget.NewEntry()
+	resIn.SetPlaceHolder("Resolution WxH, e.g. 640x360")
+	resIn.SetText(fmt.Sprintf("%dx%d", st.local.Media.Width, st.local.Media.Height))
+	fpsIn := widget.NewEntry()
+	fpsIn.SetPlaceHolder("FPS")
+	fpsIn.SetText(fmt.Sprintf("%d", st.local.Media.FPS))
+	vbIn := widget.NewEntry()
+	vbIn.SetPlaceHolder("Video bitrate kbps")
+	vbIn.SetText(fmt.Sprintf("%d", st.local.Media.VideoBitrateKbps))
+	abIn := widget.NewEntry()
+	abIn.SetPlaceHolder("Audio bitrate kbps")
+	abIn.SetText(fmt.Sprintf("%d", st.local.Media.AudioBitrateKbps))
+	turnURLIn := widget.NewEntry()
+	turnURLIn.SetPlaceHolder("TURN URL (turn:host:3478?transport=udp)")
+	turnURLIn.SetText(st.local.Turn.URL)
+	turnUserIn := widget.NewEntry()
+	turnUserIn.SetPlaceHolder("TURN username")
+	turnUserIn.SetText(st.local.Turn.Username)
+	turnPassIn := widget.NewPasswordEntry()
+	turnPassIn.SetPlaceHolder("TURN password")
+	turnPassIn.SetText(st.local.Turn.Password)
+	saveCallCfgBtn := widget.NewButton("Save Call Settings", func() {
+		wv, hv := parseResolution(resIn.Text, st.local.Media.Width, st.local.Media.Height)
+		st.local.Media.FFmpegPath = strings.TrimSpace(ffmpegPathIn.Text)
+		st.local.Media.VideoDevice = strings.TrimSpace(videoDevIn.Text)
+		st.local.Media.AudioDevice = strings.TrimSpace(audioDevIn.Text)
+		st.local.Media.Width = wv
+		st.local.Media.Height = hv
+		st.local.Media.FPS = parseIntOr(fpsIn.Text, st.local.Media.FPS)
+		st.local.Media.VideoBitrateKbps = parseIntOr(vbIn.Text, st.local.Media.VideoBitrateKbps)
+		st.local.Media.AudioBitrateKbps = parseIntOr(abIn.Text, st.local.Media.AudioBitrateKbps)
+		st.local.Turn.URL = strings.TrimSpace(turnURLIn.Text)
+		st.local.Turn.Username = strings.TrimSpace(turnUserIn.Text)
+		st.local.Turn.Password = strings.TrimSpace(turnPassIn.Text)
+		_ = st.saveLocalState()
+		dialog.ShowInformation("Call Settings", "Saved call/media settings.", w)
 	})
 
 	mediaList := widget.NewList(
@@ -377,7 +432,7 @@ func main() {
 
 	centerPanel := container.NewVBox(
 		widget.NewCard("Conversation", "", chatLog),
-		widget.NewCard("Status", "", container.NewVBox(presenceLabel, typingLabel)),
+		widget.NewCard("Status", "", container.NewVBox(presenceLabel, typingLabel, callDiagLabel)),
 		container.NewGridWithColumns(2, sendBtn, syncBtn),
 		chatInput,
 	)
@@ -391,7 +446,10 @@ func main() {
 			container.NewGridWithColumns(2, addMemberBtn, removeMemberBtn),
 			groupMsgInput, sendGroupBtn,
 		)),
-		widget.NewCard("Calls", "", container.NewVBox(callBtn)),
+		widget.NewCard("Calls", "", container.NewVBox(
+			callBtn, ffmpegPathIn, videoDevIn, audioDevIn, resIn, fpsIn, vbIn, abIn,
+			turnURLIn, turnUserIn, turnPassIn, saveCallCfgBtn,
+		)),
 	)
 
 	midSplit := container.NewHSplit(centerPanel, rightPanel)
@@ -420,6 +478,7 @@ func main() {
 				if idx < len(cs) {
 					typingLabel.SetText(st.typingSummary(cs[idx].NodeID))
 					presenceLabel.SetText("Presence: " + st.peerPresenceSummary(cs[idx].NodeID))
+					callDiagLabel.SetText("Call: " + st.rtcDiagnostics(cs[idx].NodeID))
 				}
 			}
 			contactsList.Refresh()
@@ -623,6 +682,21 @@ func (s *state) loadLocalState() error {
 	if st.Sessions == nil {
 		st.Sessions = map[string]sessionState{}
 	}
+	if st.Media.Width <= 0 {
+		st.Media.Width = 640
+	}
+	if st.Media.Height <= 0 {
+		st.Media.Height = 360
+	}
+	if st.Media.FPS <= 0 {
+		st.Media.FPS = 30
+	}
+	if st.Media.VideoBitrateKbps <= 0 {
+		st.Media.VideoBitrateKbps = 700
+	}
+	if st.Media.AudioBitrateKbps <= 0 {
+		st.Media.AudioBitrateKbps = 64
+	}
 	s.local = st
 	return nil
 }
@@ -742,7 +816,11 @@ func (s *state) publishEnvelope(c peerContact, env messageEnvelope) error {
 	if len(ledger.Messages) > 800 {
 		ledger.Messages = ledger.Messages[len(ledger.Messages)-800:]
 	}
-	return s.client.DHTPut(ctx, key, marshalJSON(ledger))
+	if err := s.client.DHTPut(ctx, key, marshalJSON(ledger)); err != nil {
+		return err
+	}
+	_ = s.compactConversationLedger(c)
+	return nil
 }
 
 func (s *state) refreshConversation(c peerContact, out *widget.Entry) error {
@@ -915,6 +993,7 @@ func (s *state) syncContactLedger(c peerContact) error {
 	if hasNew {
 		_ = s.saveLocalState()
 	}
+	_ = s.compactConversationLedger(c)
 	return nil
 }
 
@@ -1397,6 +1476,75 @@ func mustDecode(sv string) []byte {
 	return b
 }
 func mustEncode(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+
+func parseIntOr(v string, def int) int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return def
+	}
+	var out int
+	if _, err := fmt.Sscanf(v, "%d", &out); err != nil || out <= 0 {
+		return def
+	}
+	return out
+}
+
+func parseResolution(v string, dw, dh int) (int, int) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return dw, dh
+	}
+	var w, h int
+	if _, err := fmt.Sscanf(v, "%dx%d", &w, &h); err != nil || w <= 0 || h <= 0 {
+		return dw, dh
+	}
+	return w, h
+}
+
+func (s *state) archivePathFor(contactID string) string {
+	return filepath.Join(filepath.Dir(s.client.ConfigPath()), "archives", contactID+".json.gz")
+}
+
+func (s *state) compactConversationLedger(c peerContact) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	key := pairKey(s.id.NodeID, c.NodeID)
+	raw, err := s.client.DHTGet(ctx, key)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var ledger conversationLedger
+	if err := json.Unmarshal(raw, &ledger); err != nil {
+		return nil
+	}
+	if len(ledger.Messages) <= 300 {
+		return nil
+	}
+	archiveCount := len(ledger.Messages) - 240
+	if archiveCount < 120 {
+		return nil
+	}
+	old := ledger.Messages[:archiveCount]
+	keep := ledger.Messages[archiveCount:]
+	if err := os.MkdirAll(filepath.Dir(s.archivePathFor(c.NodeID)), 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(s.archivePathFor(c.NodeID))
+	if err != nil {
+		return err
+	}
+	gz := gzip.NewWriter(f)
+	if _, err := gz.Write(marshalJSON(old)); err != nil {
+		_ = gz.Close()
+		_ = f.Close()
+		return err
+	}
+	_ = gz.Close()
+	_ = f.Close()
+	ledger.Messages = keep
+	ledger.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	return s.client.DHTPut(ctx, key, marshalJSON(ledger))
+}
 
 func (s *state) showMediaPreview(path string, win fyne.Window) {
 	ext := strings.ToLower(filepath.Ext(path))

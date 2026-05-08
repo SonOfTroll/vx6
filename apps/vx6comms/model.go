@@ -95,6 +95,25 @@ type localState struct {
 	RecvSeq      map[string]uint64       `json:"recv_seq"`
 	Sessions     map[string]sessionState `json:"sessions"`
 	Prekeys      x3dhPrekeys             `json:"prekeys"`
+	Media        mediaConfig             `json:"media"`
+	Turn         turnConfig              `json:"turn"`
+}
+
+type mediaConfig struct {
+	FFmpegPath       string `json:"ffmpeg_path"`
+	VideoDevice      string `json:"video_device"`
+	AudioDevice      string `json:"audio_device"`
+	Width            int    `json:"width"`
+	Height           int    `json:"height"`
+	FPS              int    `json:"fps"`
+	VideoBitrateKbps int    `json:"video_bitrate_kbps"`
+	AudioBitrateKbps int    `json:"audio_bitrate_kbps"`
+}
+
+type turnConfig struct {
+	URL      string `json:"url"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 type x3dhBundle struct {

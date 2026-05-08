@@ -7,6 +7,7 @@ import (
 	"net"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,7 +53,15 @@ func (s *state) ensureRTCSession(peer peerContact) (*rtcSession, error) {
 		return srt, nil
 	}
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	pcCfg := webrtc.Configuration{}
+	if strings.TrimSpace(s.local.Turn.URL) != "" {
+		pcCfg.ICEServers = []webrtc.ICEServer{{
+			URLs:       []string{strings.TrimSpace(s.local.Turn.URL)},
+			Username:   strings.TrimSpace(s.local.Turn.Username),
+			Credential: s.local.Turn.Password,
+		}}
+	}
+	pc, err := webrtc.NewPeerConnection(pcCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +111,7 @@ func (s *state) ensureRTCSession(peer peerContact) (*rtcSession, error) {
 	}
 	_, _ = pc.AddTrack(videoTrack)
 	_, _ = pc.AddTrack(audioTrack)
-	go s.startCapturePipeline(ctx, ss, videoTrack, audioTrack)
+	go s.startCapturePipeline(ctx, ss, videoTrack, audioTrack, s.local.Media)
 
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -124,6 +133,10 @@ func (s *state) ensureRTCSession(peer peerContact) (*rtcSession, error) {
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateDisconnected {
 			cancel()
+			go func() {
+				time.Sleep(2 * time.Second)
+				_ = s.initiateWebRTCCall(peer)
+			}()
 		}
 	})
 
@@ -172,7 +185,7 @@ func (s *state) pushSyntheticRTP(ctx context.Context, track *webrtc.TrackLocalSt
 	}
 }
 
-func (s *state) startCapturePipeline(ctx context.Context, ss *rtcSession, videoTrack, audioTrack *webrtc.TrackLocalStaticRTP) {
+func (s *state) startCapturePipeline(ctx context.Context, ss *rtcSession, videoTrack, audioTrack *webrtc.TrackLocalStaticRTP, cfg mediaConfig) {
 	vConn, vPort, err := listenRTPPort()
 	if err != nil {
 		go s.pushSyntheticRTP(ctx, videoTrack, ss.videoSSRC)
@@ -186,7 +199,7 @@ func (s *state) startCapturePipeline(ctx context.Context, ss *rtcSession, videoT
 	}
 	defer aConn.Close()
 
-	cmd := buildFFmpegCaptureCommand(vPort, aPort)
+	cmd := buildFFmpegCaptureCommand(vPort, aPort, cfg)
 	if cmd == nil {
 		go s.pushSyntheticRTP(ctx, videoTrack, ss.videoSSRC)
 		return
@@ -249,20 +262,48 @@ func relayRTP(ctx context.Context, conn *net.UDPConn, track *webrtc.TrackLocalSt
 	}
 }
 
-func buildFFmpegCaptureCommand(videoPort, audioPort int) *exec.Cmd {
-	ffmpegPath, err := exec.LookPath("ffmpeg")
+func buildFFmpegCaptureCommand(videoPort, audioPort int, cfg mediaConfig) *exec.Cmd {
+	ffmpegPath := strings.TrimSpace(cfg.FFmpegPath)
+	var err error
+	if ffmpegPath == "" {
+		ffmpegPath, err = exec.LookPath("ffmpeg")
+	} else {
+		_, err = exec.LookPath(ffmpegPath)
+	}
 	if err != nil {
 		return nil
+	}
+	width := cfg.Width
+	height := cfg.Height
+	if width <= 0 {
+		width = 640
+	}
+	if height <= 0 {
+		height = 360
+	}
+	fps := cfg.FPS
+	if fps <= 0 {
+		fps = 30
+	}
+	vb := cfg.VideoBitrateKbps
+	if vb <= 0 {
+		vb = 700
+	}
+	ab := cfg.AudioBitrateKbps
+	if ab <= 0 {
+		ab = 64
 	}
 	baseOut := []string{
 		"-analyzeduration", "0",
 		"-probesize", "32",
 		"-vcodec", "libvpx",
+		"-b:v", fmt.Sprintf("%dk", vb),
 		"-deadline", "realtime",
 		"-cpu-used", "5",
 		"-f", "rtp",
 		fmt.Sprintf("rtp://127.0.0.1:%d", videoPort),
 		"-acodec", "libopus",
+		"-b:a", fmt.Sprintf("%dk", ab),
 		"-f", "rtp",
 		fmt.Sprintf("rtp://127.0.0.1:%d", audioPort),
 	}
@@ -272,26 +313,42 @@ func buildFFmpegCaptureCommand(videoPort, audioPort int) *exec.Cmd {
 	}
 	switch runtime.GOOS {
 	case "linux":
+		vdev := cfg.VideoDevice
+		if strings.TrimSpace(vdev) == "" {
+			vdev = "/dev/video0"
+		}
+		adev := cfg.AudioDevice
+		if strings.TrimSpace(adev) == "" {
+			adev = "default"
+		}
 		return build([]string{
-			"-f", "v4l2", "-i", "/dev/video0",
-			"-f", "pulse", "-i", "default",
+			"-f", "v4l2", "-i", vdev,
+			"-f", "pulse", "-i", adev,
 			"-pix_fmt", "yuv420p",
-			"-r", "30",
-			"-s", "640x360",
+			"-r", fmt.Sprintf("%d", fps),
+			"-s", fmt.Sprintf("%dx%d", width, height),
 		})
 	case "windows":
+		in := cfg.VideoDevice
+		if strings.TrimSpace(in) == "" {
+			in = "video=default:audio=default"
+		}
 		return build([]string{
-			"-f", "dshow", "-i", "video=default:audio=default",
+			"-f", "dshow", "-i", in,
 			"-pix_fmt", "yuv420p",
-			"-r", "30",
-			"-s", "640x360",
+			"-r", fmt.Sprintf("%d", fps),
+			"-s", fmt.Sprintf("%dx%d", width, height),
 		})
 	case "darwin":
+		in := cfg.VideoDevice
+		if strings.TrimSpace(in) == "" {
+			in = "0:0"
+		}
 		return build([]string{
-			"-f", "avfoundation", "-i", "0:0",
+			"-f", "avfoundation", "-i", in,
 			"-pix_fmt", "yuv420p",
-			"-r", "30",
-			"-s", "640x360",
+			"-r", fmt.Sprintf("%d", fps),
+			"-s", fmt.Sprintf("%dx%d", width, height),
 		})
 	default:
 		return nil
@@ -399,4 +456,12 @@ func derefUint16(v *uint16) uint16 {
 		return 0
 	}
 	return *v
+}
+
+func (s *state) rtcDiagnostics(peerID string) string {
+	ss, ok := s.rtcLoad(peerID)
+	if !ok || ss == nil || ss.pc == nil {
+		return "idle"
+	}
+	return fmt.Sprintf("%s / ICE:%s", ss.pc.ConnectionState().String(), ss.pc.ICEConnectionState().String())
 }

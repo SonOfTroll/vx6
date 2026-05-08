@@ -38,6 +38,16 @@ Native desktop communications app over VX6 SDK (Linux-first baseline).
 - Group event ledger with membership and role actions (`add/remove/promote/demote`) + group message events
 - Media inbox browser from configured downloads directory
 - Media index file stored locally (`vx6comms-media-index.json`) so files remain visible in filesystem and app
+- Conversation storage compaction:
+  - active ledger trimmed
+  - older message chunks archived with gzip under local `archives/`
+- Call diagnostics label (PeerConnection/ICE state)
+- Call settings UI for:
+  - ffmpeg path
+  - device input selection
+  - resolution/fps
+  - bitrate controls
+  - TURN URL/credentials
 - Periodic sync of requests/conversations + retry pump
 
 ## Build (Linux)
@@ -64,6 +74,8 @@ Run org mode:
 - Linux capture defaults currently use:
   - video: `/dev/video0` (v4l2)
   - audio: `pulse` device `default`
+- Windows capture default uses `dshow` input `video=default:audio=default`
+- macOS capture default uses `avfoundation` input `0:0`
 - If these devices are unavailable, the app falls back to synthetic RTP keepalive frames so signaling/transport stays testable.
 
 ## Cross-build (next)
