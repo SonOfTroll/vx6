@@ -31,7 +31,7 @@ Before any Commercial Use, you must obtain prior written permission from the Lic
 Commercial permission requests must be submitted through:
 
 - Email: **`suryanshdeshwal@gmail.com`**
-- GitHub: **https://github.com/dailker**
+- GitHub: **https://github.com/ethical-buddy**
 
 No Commercial Use rights are granted unless and until a written commercial agreement is fully executed by the Licensor.
 
