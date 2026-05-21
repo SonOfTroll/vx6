@@ -255,3 +255,23 @@ It is best described as:
 - a strong working prototype
 - protocol-complete enough for real usage
 - still in need of hardening, failover polish, and deeper adversarial testing
+
+## Licensing
+
+VX6 uses a dual-licensing model:
+
+- Open/community usage is available under Apache-2.0: [LICENSE](./LICENSE)
+- Commercial usage requires prior written permission from Suryansh Deshwal under separate terms: [LICENSE-COMMERCIAL.md](./LICENSE-COMMERCIAL.md)
+
+Related legal files:
+
+- [NOTICE](./NOTICE)
+- [TRADEMARK.md](./TRADEMARK.md)
+
+Commercial-use request flow:
+
+1. Send a written request with intended commercial use details.
+2. Contact through:
+   - Email: `suryanshdeshwal@gmail.com`
+   - GitHub: https://github.com/dailker
+3. Wait for explicit written approval and a signed commercial agreement before commercial deployment or distribution.

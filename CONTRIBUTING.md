@@ -51,3 +51,9 @@ Open an issue or short design note before changing:
 ## Security
 
 Do not commit private keys, captured traffic, credentials, or lab secrets. If a change affects trust boundaries or transport guarantees, document the assumptions directly in the pull request.
+
+## Contribution Licensing
+
+Unless separately agreed in writing, contributions submitted to VX6 are accepted under Apache-2.0 terms.
+
+Commercial rights are handled only through separate written agreements with the licensor (see `LICENSE-COMMERCIAL.md`).
