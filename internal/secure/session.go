@@ -1,6 +1,3 @@
-// Copyright (c) 2026 Suryansh Deshwal
-// Licensed under the Apache License, Version 2.0
-
 package secure
 
 import (
@@ -26,7 +23,10 @@ import (
 const maxHandshakeSize = 8 * 1024
 const maxChunkSize = 32 * 1024
 
+const sessionVersion = uint8(2)
+
 type hello struct {
+	Version   uint8  `json:"version"`
 	NodeID    string `json:"node_id"`
 	PublicKey string `json:"public_key"`
 	Ephemeral string `json:"ephemeral"`
@@ -76,6 +76,10 @@ func handshake(conn net.Conn, kind byte, id identity.Identity, initiator bool) (
 		return nil, err
 	}
 
+	if remoteHello.Version != sessionVersion {
+		return nil, fmt.Errorf("secure: peer uses session version %d, we require %d", remoteHello.Version, sessionVersion)
+	}
+
 	if !initiator {
 		if err := writeHello(conn, localHello); err != nil {
 			return nil, err
@@ -95,8 +99,14 @@ func handshake(conn net.Conn, kind byte, id identity.Identity, initiator bool) (
 		return nil, fmt.Errorf("derive shared key: %w", err)
 	}
 
+	localStaticPub := []byte(id.PublicKey)
+	remoteStaticPub, err := base64.StdEncoding.DecodeString(remoteHello.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("decode remote static public key: %w", err)
+	}
+
 	localEph := priv.PublicKey().Bytes()
-	transcript := buildTranscript(kind, localEph, remoteEph, id.NodeID, remoteHello.NodeID, initiator)
+	transcript := buildTranscript(kind, localEph, remoteEph, localStaticPub, remoteStaticPub, initiator)
 
 	key, err := deriveKey(shared, transcript)
 	if err != nil {
@@ -130,7 +140,7 @@ func handshake(conn net.Conn, kind byte, id identity.Identity, initiator bool) (
 
 func deriveKey(sharedSecret, transcript []byte) ([]byte, error) {
 	salt := sha256.Sum256(transcript)
-	kdf := hkdf.New(sha256.New, sharedSecret, salt[:], []byte("vx6-session-v1"))
+	kdf := hkdf.New(sha256.New, sharedSecret, salt[:], []byte("vx6-session-v2"))
 	key := make([]byte, 32)
 	if _, err := io.ReadFull(kdf, key); err != nil {
 		return nil, err
@@ -138,28 +148,27 @@ func deriveKey(sharedSecret, transcript []byte) ([]byte, error) {
 	return key, nil
 }
 
-func buildTranscript(kind byte, localEph, remoteEph []byte, localID, remoteID string, initiator bool) []byte {
-	var clientEph, serverEph []byte
-	var clientID, serverID string
+func buildTranscript(kind byte, localEph, remoteEph, localStaticPub, remoteStaticPub []byte, initiator bool) []byte {
+	var clientEph, serverEph, clientPub, serverPub []byte
 	if initiator {
 		clientEph = localEph
 		serverEph = remoteEph
-		clientID = localID
-		serverID = remoteID
+		clientPub = localStaticPub
+		serverPub = remoteStaticPub
 	} else {
 		clientEph = remoteEph
 		serverEph = localEph
-		clientID = remoteID
-		serverID = localID
+		clientPub = remoteStaticPub
+		serverPub = localStaticPub
 	}
 
 	var out []byte
-	out = append(out, []byte("vx6-transcript-v1\n")...)
+	out = append(out, []byte("vx6-transcript-v2\n")...)
 	out = append(out, kind)
 	out = append(out, '\n')
-	out = append(out, []byte(clientID)...)
+	out = append(out, clientPub...)
 	out = append(out, '\n')
-	out = append(out, []byte(serverID)...)
+	out = append(out, serverPub...)
 	out = append(out, '\n')
 	out = append(out, clientEph...)
 	out = append(out, serverEph...)
@@ -214,6 +223,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 func buildHello(id identity.Identity, kind byte, eph []byte) (hello, error) {
 	sig := ed25519.Sign(id.PrivateKey, signingPayload(kind, id.NodeID, eph))
 	return hello{
+		Version:   sessionVersion,
 		NodeID:    id.NodeID,
 		PublicKey: base64.StdEncoding.EncodeToString(id.PublicKey),
 		Ephemeral: base64.StdEncoding.EncodeToString(eph),
