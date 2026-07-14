@@ -42,3 +42,4 @@ jobs:
 
       - name: Cross-build macOS
         run: GOOS=darwin GOARCH=amd64 go build ./cmd/vx6
+
